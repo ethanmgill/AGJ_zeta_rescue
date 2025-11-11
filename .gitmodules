@@ -1,0 +1,9 @@
+[submodule "src/jmu_ros2_util"]
+	path = src/jmu_ros2_util
+	url = git@github.com:JMU-ROBOTICS-VIVA/jmu_ros2_util.git
+[submodule "src/ros2_aruco"]
+	path = src/ros2_aruco
+	url = git@github.com:JMU-ROBOTICS-VIVA/ros2_aruco.git
+[submodule "src/zeta_competition"]
+	path = src/zeta_competition
+	url = git@github.com:JMU-ROBOTICS-VIVA/zeta_competition.git
