@@ -1,0 +1,22 @@
+running develop
+running egg_info
+creating wander.egg-info
+writing wander.egg-info/PKG-INFO
+writing dependency_links to wander.egg-info/dependency_links.txt
+writing entry points to wander.egg-info/entry_points.txt
+writing requirements to wander.egg-info/requires.txt
+writing top-level names to wander.egg-info/top_level.txt
+writing manifest file 'wander.egg-info/SOURCES.txt'
+reading manifest file 'wander.egg-info/SOURCES.txt'
+writing manifest file 'wander.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/gill2ex/proj_ws/install/wander/lib/python3.12/site-packages/wander.egg-link (link to .)
+Installing wander_node script to /home/gill2ex/proj_ws/install/wander/lib/wander
+
+Installed /home/gill2ex/proj_ws/build/wander
+running symlink_data
+creating /home/gill2ex/proj_ws/install/wander/share/ament_index
+creating /home/gill2ex/proj_ws/install/wander/share/ament_index/resource_index
+creating /home/gill2ex/proj_ws/install/wander/share/ament_index/resource_index/packages
+symbolically linking /home/gill2ex/proj_ws/build/wander/resource/wander -> /home/gill2ex/proj_ws/install/wander/share/ament_index/resource_index/packages
+symbolically linking /home/gill2ex/proj_ws/build/wander/package.xml -> /home/gill2ex/proj_ws/install/wander/share/wander
