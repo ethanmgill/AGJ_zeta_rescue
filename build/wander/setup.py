@@ -1,1 +1,0 @@
-/home/gill2ex/proj_ws/src/wander/setup.py

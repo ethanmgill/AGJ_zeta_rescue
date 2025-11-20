@@ -1,2 +1,0 @@
-[console_scripts]
-wander_node = wander.wander_node:main
