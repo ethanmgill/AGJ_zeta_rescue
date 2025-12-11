@@ -35,68 +35,26 @@ from tf2_ros.transform_listener import TransformListener
 import tf_transformations
 import tf2_geometry_msgs # needed even tho not used explicitly
 import random #for sampling points
-from rclpy.time import Time
-
-def create_nav_goal(x, y, theta):
-    goal = NavigateToPose.Goal()
-    goal.pose.header.frame_id = 'map'
-    goal.pose.pose.position.x = x
-    goal.pose.pose.position.y = y
-    q = tf_transformations.quaternion_from_euler(0, 0, theta, 'rxyz')
-    goal.pose.pose.orientation.x = q[0]
-    goal.pose.pose.orientation.y = q[1]
-    goal.pose.pose.orientation.z = q[2]
-    goal.pose.pose.orientation.w = q[3]
-    return goal
 
 
 # navigation states NOTE: potentially redundant
 class NavState(Enum):
-    EXPLORING = 0   # searching for victims
-    APPROACHING = 1 # approaching a victim
-    HOMEBOUND = 2   # returning home
-    WAITING = 3     # waiting for a new goal
-    CANCELING = 4   # cancelling navigation
-    SETUP = 5       # setting up competition
+    EXPLORING = 0       # searching for victims
+    APPROACHING = 1     # approaching a victim
+    HOMEBOUND = 2       # returning home
+    WAITING = 3         # waiting for a new goal
+    RECALIBRATING = 4   # resetting nav service for next state
+    SETUP = 5           # setting up competition
+
 
 class WaypointNavigator(rclpy.node.Node):
 
     def __init__(self):
         super().__init__('waypoint_nav')
 
-        # TODO: change to use relative points based off of competition grid
-        self.waypoints = []
-        #[
-            #(-2.0, 2.5, 0.0), (-4.0, 2.0, 0.0), (1.5, 2.5, 0.0),
-            #(4.0, 2.0, 0.0), (6.0, 2.0, -1.57), (6.0, 0.5, -1.57), (-4.0, 0.0, 0.0),
-            #(-2.0, 0.0, 0.0), (1.5, 0.0, 0.0), (4.0, -0.2, 0.0), (6.0, -1.0, 1.57),
-            #(-4.0, -1.5, 0.0), (-2.0, -2.0, 0.0), (1.5, -2.0, 0.0), (4.0, -2.0, 0.0),
-        #]
+        '''----------------PARAMETERS----------------'''
 
-        self.map = None
-
-        # This QOS Setting is used for topics where the messages
-        # should continue to be available indefinitely once they are
-        # published. Maps fall into this category.  They typically
-        # don't change, so it makes sense to publish them once.
-        latching_qos = QoSProfile(depth=1,
-                                  durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
-
-
-        # declare parameters
-        self.declare_parameter('time_limit', 120)
-        
-        self.declare_parameter('recall_time', 50)
-        
-        self.declare_parameter(
-            name="aruco_topic",
-            value="/aruco_markers",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description="Aruco Markers topic to subscribe to",
-            ),
-        )
-
+        # VICTIM TRACKING #
         self.declare_parameter(
             name="victim_x_tolerance",
             value=0.5,
@@ -105,7 +63,6 @@ class WaypointNavigator(rclpy.node.Node):
                 description="Tolerance value for detecing victims in the x axis"
             )
         )
-
         self.declare_parameter(
             name="victim_y_tolerance",
             value=0.5,
@@ -115,304 +72,197 @@ class WaypointNavigator(rclpy.node.Node):
             )
         )
 
-        # grab variables
-        self.time_limit = self.get_parameter('time_limit').value
-        
-        self.recall_time = self.get_parameter('recall_time').value
-        
-        aruco_topic = ( # assign the aruco topic as a string value
-            self.get_parameter("aruco_topic").get_parameter_value().string_value
+        # COMPETITION MANAGEMENT #
+        self.declare_parameter(
+            name="time_limit",
+            value=120,
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_STRING,
+                description="Time limit for competition round"
+            )
         )
 
-        self.victim_y_tolerance = (
+        '''------------INSTANCE VARIABLES------------'''
+
+        # MACROS #
+        latching_qos        = QoSProfile(      # QOS setting for persistent messages
+            depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
+        )
+
+        # STATE INDICATORS #
+        self.nav_state      = NavState.SETUP    # initial state
+        self.next_state     = NavState.WAITING  # next state to switch to
+        self.nav_future     = None              # state of canceling navigation
+        self.cancel_future  = None              # state of navigation service
+
+        # NAVIGATION #
+        self.map        = None
+        self.waypoints  = []
+        self.home_goal  = None
+        self.nav_goal   = None
+        self.cur_pose   = None
+
+        # VICTIM TRACKING #
+        self.victim_count       = 0
+        self.marked_victims     = []
+        self.captured_victims   = []
+        self.cur_image = None
+        self.victim_y_tolerance = (     # tolerance for detecting a new victim
             self.get_parameter("victim_y_tolerance").get_parameter_value().double_value
         )
         self.victim_x_tolerance = (
             self.get_parameter("victim_x_tolerance").get_parameter_value().double_value
         )
 
-        # mark start time of competition
-        
+        # COMPETITION MANAGEMENT #
         self.start_time = time.time()
+        self.time_limit = self.get_parameter('time_limit').value
+        self.recall_time = 30           # time at which the robot must return
+                                        # TODO: calculate with cur_pose callback
 
-        # set state indicators
+        '''---------------SUBSCRIPTIONS--------------'''
 
-        self.nav_state = NavState.SETUP
-        self.nav_future = None # most recent status of nav service
-        self.cancel_future = None
-        self.goal = None # navigation service goal
+        # COMPETITION MANAGEMENT #
+        ''' TODO: implement callback function
+        self.create_subscription(
+            Empty, '/report_requested', self.report_req_callback, 10
+        )
+        '''
 
-        self.map = None
-        
-        # initialize home pose to default: 0,0,0
-        # self.home_x = 0.0
-        # self.home_y = 0.0
-        # self.home_theta = 0.0
-        self.home_goal = None
-
-        # declare current pose
-        self.cur_pose = None
-
-        # declare current image (updated by camera topic)
-        self.cur_image = None
-
-        # declare services
-        self.ac = ActionClient(self, NavigateToPose, '/navigate_to_pose') # this is used to communicate with the nav service
-        #self.cancel_client = self.create_client(CancelGoal, '/navigate_to_pose/_action/cancel_goal') # this is used to cancel the nav service
-
-        # declare subscribers
-        self.aruco_sub = self.create_subscription(
-            ArucoMarkers, '/aruco_markers', self.aruco_callback, qos_profile_sensor_data
+        # NAVIGATION / EXPLORATION #
+        self.create_subscription(
+            OccupancyGrid, 'map', self.map_callback, qos_profile=latching_qos
         )
         self.cur_pose_sub = self.create_subscription(
             PoseStamped, '/amcl_pose', self.amcl_callback, qos_profile_sensor_data
         )
-        ''' TODO: implement callback function
-        self.report_req_sub = self.create_subscription(
-            Empty, '/report_requested', self.report_req_callback, 10
-        )
-        '''
-        self.camera_sub = self.create_subscription(
+
+        # VICTIM TRACKING #
+        self.create_subscription(
             Image, '/oakd/rgb/preview/image_raw', self.camera_callback, qos_profile_sensor_data
         )
-        
-        self.create_subscription(OccupancyGrid, 'map',
-                                 self.map_callback,
-                                 qos_profile=latching_qos)
-        
-        # declare publishers
+        self.aruco_sub = self.create_subscription(
+            ArucoMarkers, '/aruco_markers', self.aruco_callback, qos_profile_sensor_data
+        )
+
+        '''----------------PUBLISHERS----------------'''
+
+        # NAVIGATION / EXPLORATION #
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10) # honestly do not know why this is here
+
+        # VICTIM TRACKING #
         self.victim_pub = self.create_publisher(Victim, '/victim', 10)
-
-        # The TransfromListener will listen for all published transforms, which will be stored in the buffer.
-        self.tf_buffer = Buffer() # buffer for transformation calculations
-        self.tf_listener = TransformListener(self.tf_buffer, self) # when a transformation is calculated, the transformer will send it to the buffer
-
-        # data structure for tracking marked victims
-        # stores tuples of x, y locations of victims
-        self.marked_victims = [] # start empty of course
-
-        # data structure for keeping victim data ready for publishing
-        self.captured_victims = []
-
-        self.timer = self.create_timer(0.5, self.timer_callback) # timer for competition management
         
+        '''-----------------SERVICES-----------------'''
 
-    ### COMPETITION MANAGEMENT ###
+        # NAVIGATION #
+        self.tf_buffer      = Buffer()                                  # buffer for transformation calculations
+        self.tf_listener    = TransformListener(self.tf_buffer, self)   # listens for published transforms
+        
+        self.ac = ActionClient(                                         # this is used to communicate with the nav service
+            self, NavigateToPose, '/navigate_to_pose'
+        )
 
-    def setup(self):
-        if not self.map: # no map
-            self.get_logger().info("Waiting on map to be set...")
-            pass
-        elif not self.waypoints:
-            # If waypoints list is empty generate them from the map
-            self.get_logger().info("No waypoints set")
-            pass
-        elif not self.cur_image: # no image data from camera
-            self.get_logger().info("No msg from camera...")
-            pass
-        else: # we are ready. change state to waiting
-            self.nav_state = NavState.WAITING
+        # COMPETITION MANAGEMENT #
+        self.timer = self.create_timer(0.5, self.timer_callback) # timer for competition management
+
+        '''-----------------------------------------------------------------------------------------------------------------'''
+
+
+
+    #####################################################
+    '''''''''''''''''''''''''''''''''''''''''''''''''''''
+    '                                                   '
+    '                    CALLBACKS                      '
+    '                                                   '
+    '''''''''''''''''''''''''''''''''''''''''''''''''''''
+    #####################################################
+
+
+    '''-------------------------------------COMPETITION TIMER CALLBACK------------------------------------------------------'''
 
     def timer_callback(self):
-        if (self.nav_state == NavState.SETUP): # competition not ready
-            self.get_logger().info("Setting up...")
+        if (self.nav_state == NavState.SETUP):          # competition not ready
             self.setup()
             return
         
-        elapsed = time.time() - self.start_time # how much time has it been since we started running?
-        time_left = self.time_limit - elapsed # how much time is left in the competition?
+        elapsed = time.time() - self.start_time         # how much time has it been since we started running?
+        time_left = self.time_limit - elapsed           # how much time is left in the competition?
         self.get_logger().info(f"\n\nTimer clock: [{elapsed:.2f}]\nTime left: [{time_left:.2f}]\nMarked Victim Count: [{len(self.marked_victims)}]\nVictim Count: [{len(self.captured_victims)}]\nCurrent Nav State: [{self.nav_state}]\n\n")
 
-        # Are we waiting for a goal to be canceled?
-        if self.cancel_future is not None: # goal has been cancelled. Awaiting ACK from server
-            self.get_logger().info("Canceling goal...")
-            # have we gotten an ACK from the nav server?
-            if self.cancel_future.done(): # if we are done cancelling the navigation
-                self.nav_future = None # reset nav_future for a new navigation task
-                self.cancel_future = None
-                if self.nav_state != NavState.APPROACHING: # if we're approaching, navigation goes to aruco_callback
-                    self.nav_state = NavState.WAITING # ready for new goal
-                self.get_logger().info("Canceled goal. Ready for new goal.")
-        
         # are we out of time?
         if time_left < self.recall_time:
             # are we already going home?
             if self.nav_state == NavState.HOMEBOUND:
-                # TODO: add program exit logic upon completion
-                pass
+                self.handle_homebound()
             # are we waiting to go home?
-            elif self.nav_state == NavState.WAITING:
-                self.nav_state = NavState.HOMEBOUND # set variable to indicate we are returning home
-                self.goal = self.home_goal # set nav goal to home goal
-                self.send_goal() # send nav goal to nav service
-                self.get_logger().info("Home goal sent.")
-            # have we canceled any ongoing navigation?
-            elif self.nav_state != NavState.CANCELING:
-                self.get_logger().warn(f"Time Low ({time_left:.1f}s)! Force Return.") # log action
-                self.nav_state = NavState.CANCELING       
-                self.cancel_future = self.nav_future.result().cancel_goal_async()
+            else:
+                self.get_logger().warn(f"\nTime low! Heading home...\n")
+                self.transition_to_state(NavState.HOMEBOUND)
 
-        # we still have time left; go exploring
+        # we still have time left; continue the mission.
         else:
             if self.nav_state == NavState.EXPLORING:
-                self.handle_navigation_status()
+                self.handle_navigation_status()             # Navigate to selected point
             elif self.nav_state == NavState.APPROACHING:
-                pass # wait for victim logging to finish
+                self.handle_approaching()                   # Approach and capture victim
             elif self.nav_state == NavState.HOMEBOUND:
-                pass # TODO: we still have time left. we should be exploring
+                self.transition_to_state(NavState.WAITING)  # This should never happen; explore
             elif self.nav_state == NavState.WAITING:
-                self.nav_to_next_waypoint()
-            elif self.nav_state == NavState.CANCELING:
-                pass # wait for navigation to finish cancelling
+                self.nav_to_next_waypoint()                 # Find a new waypoint to explore
+            elif self.nav_state == NavState.RECALIBRATING:
+                self.handle_recalibration()                 # Reset nav service and switch to next state
 
-    def handle_navigation_status(self, recovery_state=NavState.WAITING):
-        if self.nav_future is not None and self.nav_future.done():
-            result = self.nav_future.result().status
-            if result == GoalStatus.STATUS_EXECUTING:
-                self.get_logger().info(f"\nExecuting navigation to point: [{self.goal.pose.pose.position.x}, {self.goal.pose.pose.position.y}]\n")
-                pass
-            elif result == GoalStatus.STATUS_SUCCEEDED:
-                self.get_logger().info(f"\nSuccesfully navigated to point: [{self.goal.pose.pose.position.x}, {self.goal.pose.pose.position.y}]\n")
-                self.nav_state = NavState.CANCELING       
-                self.cancel_future = self.nav_future.result().cancel_goal_async()
-            elif result == GoalStatus.STATUS_CANCELING:
-                self.get_logger().info(f"\nCancelling navigation to point: [{self.goal.pose.pose.position.x}, {self.goal.pose.pose.position.y}]\n")
-                pass
-            elif result == GoalStatus.STATUS_CANCELED:
-                self.get_logger().info(f"\nCancelled navigation to point: [{self.goal.pose.pose.position.x}, {self.goal.pose.pose.position.y}]\n")
-                pass
-            elif result == GoalStatus.STATUS_ABORTED:
-                self.get_logger().warn(f"\nABORTED navigation to point: [{self.goal.pose.pose.position.x}, {self.goal.pose.pose.position.y}]")
-                self.get_logger().warn(f"Recovering from abort. Resetting...")
-                self.nav_future = None
-                self.nav_state = recovery_state
-                pass
-            elif result == GoalStatus.STATUS_ACCEPTED:
-                self.get_logger().info(f"\nAccepted navigation to point: [{self.goal.pose.pose.position.x}, {self.goal.pose.pose.position.y}]\n")
-                pass
-            elif result == GoalStatus.STATUS_UNKNOWN:
-                self.get_logger().warn(f"\nUNKNOWN STATUS of navigation to point: [{self.goal.pose.pose.position.x}, {self.goal.pose.pose.position.y}]\n")
-                #self.get_logger().warn(f"Recovering from unknown. Resetting...")
-                #self.nav_future = None
-                #self.nav_state = recovery_state
-                pass
-            else:
-                self.get_logger().warn(f"Unexpected navigation goal status. GoalStatus=[{result}]")
-        elif self.nav_future is None: # error handling
-            self.get_logger().warn(f"Unexpected navigation status. Resetting...")
-            self.nav_state = recovery_state
-        elif not self.nav_future.done():
-            self.get_logger().warn(f"Navigation server has not accepted goal yet...")
+    '''-------------------------------------OUR POSE IN MAP FRAME CALLBACK--------------------------------------------------'''
+
+    def amcl_callback(self, cur_pose):
+        # PoseWithCovarianceStamped -> PoseWithCovariance -> Pose
+        self.cur_pose = cur_pose.pose.pose
+        if self.home_goal is None:
+            self.set_home_goal()
+
+    '''-------------------------------------ARUCO MARKER DETECTION CALLBACK-------------------------------------------------'''
+
+    # function to be called when an aruco code is detected
+    def aruco_callback(self, aruco_msg):
+
+        # ensure we're not returning home
+        if self.nav_state == NavState.HOMEBOUND or self.nav_state == NavState.SETUP:
+            return
+        if aruco_msg is None:
+            self.get_logger().warn("No Aruco info has been received!")
+            return
+        
+        # DEBUG: self.get_logger().info("ARUCO MARKER DETECTED")
+
+        if self.nav_state != NavState.APPROACHING:  # we've already locked on to a victim. No need to calculate
+            
+            # get a new victim pose if found
+            target_victim_pose = self.get_new_victim_pose(aruco_msg)
+            if target_victim_pose is None:
+                return                              # ignore this aruco callback. No new victim found
+
+            # mark victim
+            self.mark_victim(target_victim_pose)
+            self.get_logger().info(f"found new victim at: [{target_victim_pose.position.x:.6f}, {target_victim_pose.position.y:.6f}]")
+
+            # calculate goal position
+            self.victim_goal = self.calculate_goal_from_victim_pose(target_victim_pose)
+            self.transition_to_state(NavState.APPROACHING)
+
+    '''-------------------------------------CAMERA RAW_IMAGE CALLBACK-------------------------------------------------------'''
+
+    def camera_callback(self, img_msg):
+        self.cur_image = img_msg # update current image from camera
+    
+    '''-------------------------------------REQUEST REPORT CALLBACK---------------------------------------------------------'''
 
     def report_req_callback(self):
         # TODO: iterate over victim list and publish to victim topic one by one
         pass
 
-    # SETUP FUNCTIONs #
+    '''-------------------------------------OCCUPANCY GRID CALLBACK---------------------------------------------------------'''
 
-    def set_home_goal(self):
-        '''
-        Takes the current pose from /amcl_pose and assigns it to the home goal
-        '''
-        if not self.cur_pose:
-            self.get_logger().warn(f"No msg to grab from /amcl_pose")
-        home_x = self.cur_pose.pose.position.x
-        home_y = self.cur_pose.pose.position.y
-        home_theta = self.cur_pose.pose.orientation
-        _, _, yaw = tf_transformations.euler_from_quaternion(
-            [home_theta.x, home_theta.y, home_theta.z, home_theta.w]
-        )
-        home_theta = yaw
-
-        self.home_goal = create_nav_goal(home_x, home_y, home_theta)
-        self.get_logger().info(f"Start Goal Set: ({home_x:.2f}, {home_y:.2f}, {home_theta})")
-
-    '''
-    # NOTE: DEPRECATED
-    def set_home_pose(self):
-        """
-        Spins and waits until the transform from base_link to map is valid.
-        """
-        self.get_logger().info("Waiting for Map Transform...") # indicate ...
-        
-        p1 = PoseStamped() # create a new pose stamped
-        p1.header.frame_id = "base_link" # indicate this poseStamped is for the home position
-        p1.pose.orientation.w = 1.0 # set home pose orientation
-
-        while rclpy.ok(): # if the instance is still running 
-            rclpy.spin_once(self, timeout_sec=0.1)
-
-            try:
-                if self.tf_buffer.can_transform("map", "base_link", rclpy.time.Time()):
-                    p2 = self.tf_buffer.transform(p1, "map")
-                    
-                    self.home_x = p2.pose.position.x
-                    self.home_y = p2.pose.position.y
-                    
-                    q = p2.pose.orientation
-                    _, _, yaw = tf_transformations.euler_from_quaternion(
-                        [q.x, q.y, q.z, q.w]
-                    )
-                    self.home_theta = yaw
-                    self.get_logger().info(f"Start Location Set: ({self.home_x:.2f}, {self.home_y:.2f})")
-                    return
-            
-            except Exception as e:
-                self.get_logger().warn(f"Transform failed: {e}")
-
-            if time.time() - self.start_time > 5.0:
-                 self.get_logger().error("Could not find map transform! Defaulting to (0,0).")
-                 return
-    '''
-
-    ### EXPLORATION ###
-
-    # TODO: this doesn't work with asynchronous programming
-    # TODO: refactor to use nav_service
-    def spin_in_place(self, speed=0.3, rotations=1.0):
-        twist = Twist()
-        twist.angular.z = speed
-        spin_time = (2 * np.pi * rotations) / speed
-        start = time.time()
-
-        while time.time() - start < spin_time:
-            self.cmd_pub.publish(twist)
-            rclpy.spin_once(self, timeout_sec=0.05)
-        
-        twist.angular.z = 0.0
-        self.cmd_pub.publish(twist)
-
-    def nav_to_next_waypoint(self):
-        # TODO: check if waypoint is free in occupancy grid before mapping to it
-        self.nav_state = NavState.EXPLORING
-        ''' TODO: map wasn't populating on spin_up...
-        free = False
-        while(not free and self.waypoints):
-            (x, y, theta) = self.waypoints.pop(0)
-            free = self.cell_is_free(x, y)
-        if not self.waypoints:
-            #TODO: return home i guess :/
-            pass
-        '''
-        (x, y, theta) = self.waypoints.pop(0)
-
-        self.get_logger().info(f"# of Waypoints remaining: [{len(self.waypoints)}]")
-        self.get_logger().info(f"PICKED POINT: ({x:.2f}, {y:.2f}).")
-        self.goal = create_nav_goal(x, y, theta) # set nav goal to next waypoint
-        self.send_goal() # send nav goal to nav service
-        self.get_logger().info(f"Waypoint goal sent.")
-
-    def send_goal(self):
-        self.get_logger().info("WAITING FOR NAVIGATION SERVER...")
-        self.ac.wait_for_server()
-        self.get_logger().info("NAVIGATION SERVER AVAILABLE...")
-        self.get_logger().info("SENDING GOAL TO NAVIGATION SERVER...")
-
-        self.nav_future = self.ac.send_goal_async(self.goal)
-
-    ### HELPFUL FUNCTIONS ###
-    
     def map_callback(self, map_msg):
         """Process the map message.
 
@@ -478,92 +328,178 @@ class WaypointNavigator(rclpy.node.Node):
             self.get_logger().info(f"HEY! Map position ({x:.2f}, {y:.2f}) is {free}")
             '''
 
-    def cell_is_free(self, x, y):
-        val = self.map.get_cell(x, y)
-        if val == 0: # cell is definitely free
-            return True
-        else: # cell might not be free. default to occupied
-            return False
+    '''---------------------------------------------------------------------------------------------------------------------'''
+
+
+    #####################################################
+    '''''''''''''''''''''''''''''''''''''''''''''''''''''
+    '                                                   '
+    '               STATE HANDLERS                      '
+    '                                                   '
+    '''''''''''''''''''''''''''''''''''''''''''''''''''''
+    #####################################################
+
     
-    def amcl_callback(self, cur_pose):
-        # PoseWithCovarianceStamped -> PoseWithCovariance -> Pose
-        self.cur_pose = cur_pose.pose.pose
-        if self.home_goal is None:
-            self.set_home_goal()
+    '''-------------------------------------EXPLORATION STATE---------------------------------------------------------------'''
+
+    def handle_navigation_status(self, recovery_state=NavState.WAITING):
+        if self.nav_future is not None and self.nav_future.done():
+            result = self.nav_future.result().status
+            if result == GoalStatus.STATUS_EXECUTING:
+                self.get_logger().info(f"\nExecuting navigation to point: [{self.nav_goal.pose.pose.position.x}, {self.nav_goal.pose.pose.position.y}]\n")
+                pass
+            elif result == GoalStatus.STATUS_SUCCEEDED and self.nav_state != NavState.APPROACHING and self.nav_state != NavState.HOMEBOUND:
+                self.get_logger().info(f"\nSuccesfully navigated to point: [{self.nav_goal.pose.pose.position.x}, {self.nav_goal.pose.pose.position.y}]\n")
+                self.transition_to_state(NavState.WAITING)
+            elif result == GoalStatus.STATUS_CANCELING:
+                self.get_logger().info(f"\nCancelling navigation to point: [{self.nav_goal.pose.pose.position.x}, {self.nav_goal.pose.pose.position.y}]\n")
+                pass
+            elif result == GoalStatus.STATUS_CANCELED:
+                self.get_logger().info(f"\nCancelled navigation to point: [{self.nav_goal.pose.pose.position.x}, {self.nav_goal.pose.pose.position.y}]\n")
+                pass
+            elif result == GoalStatus.STATUS_ABORTED:
+                self.get_logger().warn(f"\nABORTED navigation to point: [{self.nav_goal.pose.pose.position.x}, {self.nav_goal.pose.pose.position.y}]")
+                self.get_logger().warn(f"Recovering from abort. Resetting...")
+                self.transition_to_state(recovery_state)
+                pass
+            elif result == GoalStatus.STATUS_ACCEPTED:
+                self.get_logger().info(f"\nAccepted navigation to point: [{self.nav_goal.pose.pose.position.x}, {self.nav_goal.pose.pose.position.y}]\n")
+                pass
+            elif result == GoalStatus.STATUS_UNKNOWN:
+                self.get_logger().warn(f"\nUNKNOWN STATUS of navigation to point: [{self.nav_goal.pose.pose.position.x}, {self.nav_goal.pose.pose.position.y}]\n")
+                pass
+            else:
+                self.get_logger().warn(f"Unexpected navigation goal status. GoalStatus=[{result}]")
+        elif self.nav_future is None: # error handling
+            self.get_logger().warn(f"Navigation service lost. Resetting...")
+            self.transition_to_state(recovery_state)
+        elif not self.nav_future.done():
+            self.get_logger().warn(f"Navigation server has not accepted goal yet...")
+
+    '''-------------------------------------APPROACHING STATE---------------------------------------------------------------'''
+
+    def handle_approaching(self):
+        if self.nav_future is None:         # nav service is ready for a goal
+            self.nav_goal = self.victim_goal
+            self.send_goal()                # victim goal is already loaded, send it.
+        else:                               # we're already navigating to the victim
+            if self.nav_future.result().status == GoalStatus.STATUS_SUCCEEDED:
+                # capture victim
+                victim = self.build_victim_datum()
+                # store victim data
+                self.captured_victims.append(victim)
+                # reset for exploration
+                self.transition_to_state(NavState.WAITING)
+            else:
+                self.handle_navigation_status(recovery_state=NavState.APPROACHING)
+
+    '''-------------------------------------RECALIBRATING STATE---------------------------------------------------------------'''
+
+    def handle_recalibration(self):
+        '''reset nav service then switch to next state'''
+        if self.nav_future is not None:
+            if self.cancel_future is None:  # nav service still running
+                self.cancel_future = self.nav_future.result().cancel_goal_async()
+            elif self.cancel_future.done(): # nav service acknowledged cancel
+                self.nav_future = None
+                self.cancel_future = None
+            else:                           # wait for nav service to acknowledge cancel
+                pass
+        else:                               # nav service reset; move to next state
+            self.nav_state = self.next_state
+
+    '''-------------------------------------HOMEBOUND STATE---------------------------------------------------------------'''
+
+    def handle_homebound(self):
+        if self.nav_future is None:         # nav service is ready for a goal
+            self.nav_goal = self.home_goal  # update navigation goal
+            self.send_goal()                # send navigation goal to nav server
+            self.get_logger().info("HOME GOAL SENT")
+        else:                               # we're already navigating home :)
+            if self.nav_future.result().status == GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().info("\n\n\nARRIVED AT HOME GOAL\n\n\n")
+                # TODO: exit gracefully?
+                pass
+            else:
+                self.handle_navigation_status(recovery_state=NavState.HOMEBOUND)
+
+    '''---------------------------------------------------------------------------------------------------------------------'''
+
+
+
+    #####################################################
+    '''''''''''''''''''''''''''''''''''''''''''''''''''''
+    '                                                   '
+    '             HELPER FUNCTIONS                      '
+    '                                                   '
+    '''''''''''''''''''''''''''''''''''''''''''''''''''''
+    #####################################################
+
+
+    '''-------------------------------------SET UP FUNCTIONS----------------------------------------------------------------'''
+
+    def setup(self):
+        if not self.map: # no map
+            self.get_logger().info("Waiting on map to be set...")
+            pass
+        elif not self.waypoints:
+            # If waypoints list is empty generate them from the map
+            self.get_logger().info("No waypoints set")
+            pass
+        elif not self.cur_image: # no image data from camera
+            self.get_logger().info("No msg from camera...")
+            pass
+        else: # we are ready. change state to waiting
+            self.get_logger().info("\n\n----STARTING COMPETITION----\n.\n.\n.")
+            self.nav_state = NavState.WAITING
     
+    def set_home_goal(self):
+        '''
+        Takes the current pose from /amcl_pose and assigns it to the home goal
+        '''
+        if not self.cur_pose:
+            self.get_logger().warn(f"No msg to grab from /amcl_pose")
+        home_x = self.cur_pose.pose.position.x
+        home_y = self.cur_pose.pose.position.y
+        home_theta = self.cur_pose.pose.orientation
+        _, _, yaw = tf_transformations.euler_from_quaternion(
+            [home_theta.x, home_theta.y, home_theta.z, home_theta.w]
+        )
+        home_theta = yaw
 
-    ### ArUco Code detection, navigation, and capture ###
+        self.home_goal = create_nav_goal(home_x, home_y, home_theta)
+        self.get_logger().info(f"Start Goal Set: ({home_x:.2f}, {home_y:.2f}, {home_theta})")
 
-    # function to be called when an aruco code is detected
-    def aruco_callback(self, aruco_msg):
-        # ensure we're not returning home
-        if self.nav_state == NavState.HOMEBOUND:
-            return # return early
-        self.get_logger().info("ARUCO MARKER DETECTED")
-        if aruco_msg is None:
-            self.get_logger().warn("No Aruco info has been received!")
-            return
+    '''-------------------------------------VICTIM TRACKING HELPERS---------------------------------------------------------'''
 
-        if self.nav_state != NavState.APPROACHING: # we've already locked on to a victim. No need to calculate
-            map_poses = []
-            for pose in aruco_msg.poses:
-                pose_stamped = PoseStamped()
-                pose_stamped.header = aruco_msg.header
-                pose_stamped.pose = pose
+    def get_new_victim_pose(self, aruco_markers):
+        '''
+        Returns a target_victim_pose based off of the aruco marker given
+        or None if no valid victims found
+        '''
+        header = aruco_markers.header   # a single header to represent the message
+        poses = aruco_markers.poses     # a list of Poses of victims
 
-                for _ in range(4):
-                    try:
-                        map_pose_stamped = self.tf_buffer.transform(pose_stamped, "map")
-                        map_pose = map_pose_stamped.pose
-                        map_poses.append(map_pose)
-                        break
-                    except Exception as e:
-                        self.get_logger().warn(f"ArUco pose transformation error: \n{str(e)}\n")
-                        self.get_logger().warn(f"\nArUco time stamp: [{pose_stamped.header.stamp}]\nMap time stamp:")
+        # iterate over each Pose, transform, and continue with the first new pose
+        for pose in poses:
+            ps = PoseStamped(header=header, pose=pose)
 
-            # pick first seen victim
-            if len(map_poses) == 0:
-                self.get_logger().warn("FAILED TO ADD MARKER")
-                return
-            
-            target_victim_pose = map_poses[0]
-
-            # TODO: iterate over target_victim_poses to find one that hasn't been marked.
-            # check if victim is already marked
-            if self.victim_marked(target_victim_pose):
-                return # exit early
-            
-            # mark victim
-            self.mark_victim(target_victim_pose)
-            self.get_logger().info(f"found new victim at: [{target_victim_pose.position.x}, {target_victim_pose.position.y}]")
-
-            # change state to indicate tracking a victim
-            self.nav_state = NavState.APPROACHING
-            # cancel navigation service
-            self.cancel_future = self.nav_future.result().cancel_goal_async()
-
-            # calculate goal position
-            self.goal = self.calculate_goal_from_victim_pose(target_victim_pose)
-
-        else: # we are approaching a victim
-            if self.cancel_future is None: # we're done canceling
-                if self.nav_future is None: # we need to navigate to the victim
-                    self.send_goal() # victim goal is already loaded, send it.
-                else: # we're already navigating to the victim
-                    if self.nav_future.result().status == GoalStatus.STATUS_SUCCEEDED:
-                        # capture victim
-                        victim = self.build_victim_datum()
-                        # store victim data
-                        self.captured_victims.append(victim)
-                        # reset for exploration
-                        self.cancel_future = self.nav_future.result().cancel_goal_async()
-                        self.nav_state = NavState.CANCELING
-                    else:
-                        self.handle_navigation_status(recovery_state=NavState.APPROACHING)
+            try:
+                map_ps = self.tf_buffer.transform(ps, "map")    # transform PoseStamped
+                map_p = map_ps.pose                             # take the Pose only
+                if self.victim_marked(map_p):
+                    continue                                    # skip victims we already marked
+                else:
+                    return map_p                                # return the transformed Pose
+            except Exception as e:
+                self.get_logger().warn(f"Err: get_new_victim_pose() ::\n{e}\n\n")
+                continue
+        return None
 
     def build_victim_datum(self):
         victim = Victim()
-        victim.id = np.int32(len(self.marked_victims - 1))
+        victim.id = self.victim_count
+        self.victim_count += 1
 
         ps = PointStamped()
         ps.header.stamp = time.time() - self.start_time
@@ -613,13 +549,84 @@ class WaypointNavigator(rclpy.node.Node):
         x_max = victim_pose.position.x + self.victim_x_tolerance
         y_min = victim_pose.position.y - self.victim_y_tolerance
         y_max = victim_pose.position.y + self.victim_y_tolerance
-        return any(x_min <= vic_x <= x_max and y_min <= vic_y <= y_max 
-                   for vic_x, vic_y in self.marked_victims)
+        return any(
+            x_min <= vic_x <= x_max and y_min <= vic_y <= y_max 
+            for vic_x, vic_y in self.marked_victims
+        )
+    
+    '''-------------------------------COMPETITION MANAGEMENT HELPERS--------------------------------------------------------'''
 
-    def camera_callback(self, img_msg):
-        self.cur_image = img_msg # update current image from camera
+    def transition_to_state(self, state):
+        '''this triggers the navigation service to recalibrate
+            to prepare to transition to a new state'''
+        self.next_state = state
+        self.nav_state = NavState.RECALIBRATING
 
-    ### End ArUco Code detection, navigation, and capture ###
+    '''-------------------------------NAVIGATION / EXPLORATION HELPERS------------------------------------------------------'''
+
+    def nav_to_next_waypoint(self):
+        # TODO: check if waypoint is free in occupancy grid before mapping to it
+        self.nav_state = NavState.EXPLORING
+        ''' TODO: map wasn't populating on spin_up...
+        free = False
+        while(not free and self.waypoints):
+            (x, y, theta) = self.waypoints.pop(0)
+            free = self.cell_is_free(x, y)
+        if not self.waypoints:
+            #TODO: return home i guess :/
+            pass
+        '''
+        (x, y, theta) = self.waypoints.pop(0)
+
+        self.get_logger().info(f"# of Waypoints remaining: [{len(self.waypoints)}]")
+        self.get_logger().info(f"PICKED POINT: ({x:.2f}, {y:.2f}).")
+        self.nav_goal = create_nav_goal(x, y, theta) # set nav goal to next waypoint
+        self.send_goal() # send nav goal to nav service
+        self.get_logger().info(f"Waypoint goal sent.")
+
+    def send_goal(self):
+        self.get_logger().info("WAITING FOR NAVIGATION SERVER...")
+        self.ac.wait_for_server()
+        self.get_logger().info("NAVIGATION SERVER AVAILABLE...")
+        self.get_logger().info("SENDING GOAL TO NAVIGATION SERVER...")
+
+        self.nav_future = self.ac.send_goal_async(self.nav_goal)
+
+    # TODO: this doesn't work with asynchronous programming
+    # TODO: refactor to use nav_service
+    def spin_in_place(self, speed=0.3, rotations=1.0):
+        twist = Twist()
+        twist.angular.z = speed
+        spin_time = (2 * np.pi * rotations) / speed
+        start = time.time()
+
+        while time.time() - start < spin_time:
+            self.cmd_pub.publish(twist)
+            rclpy.spin_once(self, timeout_sec=0.05)
+        
+        twist.angular.z = 0.0
+        self.cmd_pub.publish(twist)
+
+    def cell_is_free(self, x, y):
+        val = self.map.get_cell(x, y)
+        if val == 0: # cell is definitely free
+            return True
+        else: # cell might not be free. default to occupied
+            return False
+
+def create_nav_goal(x, y, theta):
+    goal = NavigateToPose.Goal()
+    goal.pose.header.frame_id = 'map'
+    goal.pose.pose.position.x = x
+    goal.pose.pose.position.y = y
+    q = tf_transformations.quaternion_from_euler(0, 0, theta, 'rxyz')
+    goal.pose.pose.orientation.x = q[0]
+    goal.pose.pose.orientation.y = q[1]
+    goal.pose.pose.orientation.z = q[2]
+    goal.pose.pose.orientation.w = q[3]
+    return goal
+
+'''-------------------------------------------------------------------------------------------------------------------------'''
 
 def main(args=None):
     rclpy.init(args=args)
