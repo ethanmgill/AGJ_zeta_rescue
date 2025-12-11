@@ -1,15 +1,19 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 def generate_launch_description():
 
-    rescue_params = os.path.join(
-        get_package_share_directory('AGJ_zeta_rescue'),
-        'config',
-        'rescue_params.yaml'
-        )
+    time_limit_arg = DeclareLaunchArgument(
+        'time_limit',
+        default_value='120',
+        description='Time limit to run competition round'
+    )
+
+    time_limit = LaunchConfiguration('time_limit')
     
     aruco_params = os.path.join(
         get_package_share_directory('ros2_aruco'),
@@ -20,8 +24,10 @@ def generate_launch_description():
     rescue_node = Node(
         package='AGJ_zeta_rescue',
         executable='zeta_rescue',
-        output='screen',
-        parameters=[rescue_params]
+        parameters=[{
+            'time_limit': time_limit
+        }],
+        output='screen'
     )
 
     aruco_node = Node(
@@ -31,6 +37,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        time_limit_arg,
         aruco_node,
         rescue_node
     ])

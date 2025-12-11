@@ -15,7 +15,6 @@ from action_msgs.msg import GoalStatus
 from action_msgs.srv import CancelGoal
 
 from std_msgs.msg import Empty
-from std_msgs.msg import Int32
 from sensor_msgs.msg import Image
 
 from nav_msgs.msg import OccupancyGrid
@@ -57,7 +56,7 @@ class WaypointNavigator(rclpy.node.Node):
         # VICTIM TRACKING #
         self.declare_parameter(
             name="victim_x_tolerance",
-            value=0.2,
+            value=0.5,
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
                 description="Tolerance value for detecing victims in the x axis"
@@ -65,7 +64,7 @@ class WaypointNavigator(rclpy.node.Node):
         )
         self.declare_parameter(
             name="victim_y_tolerance",
-            value=0.2,
+            value=0.5,
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
                 description="Tolerance value for detecing victims in the y axis"
@@ -78,7 +77,8 @@ class WaypointNavigator(rclpy.node.Node):
             value=120,
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
-                description="Time limit for competition round"
+                description="Time limit for competition round",
+                read_only=False
             )
         )
 
@@ -191,7 +191,7 @@ class WaypointNavigator(rclpy.node.Node):
             Timer clock: [{elapsed:.2f}]\n
             Time left: [{time_left:.2f}]\n
             Marked Victim Count: [{len(self.marked_victims)}]\n
-            Victim Count: [{len(self.captured_victims)}]\n
+            Victim Count: [{len(self.captured_victims)}] = [{self.victim_count}]\n
             Current Nav State: [{self.nav_state}]
             Home Set: [{self.home_goal is not None}]
             \n\n""")
@@ -248,16 +248,16 @@ class WaypointNavigator(rclpy.node.Node):
         if self.nav_state != NavState.APPROACHING:  # we've already locked on to a victim. No need to calculate
             
             # get a new victim pose if found
-            target_victim_pose = self.get_new_victim_pose(aruco_msg)
-            if target_victim_pose is None:
+            target_victim_ps = self.get_new_victim_pose(aruco_msg)
+            if target_victim_ps is None:
                 return                              # ignore this aruco callback. No new victim found
 
             # mark victim
-            self.mark_victim(target_victim_pose)
-            self.get_logger().info(f"found new victim at: [{target_victim_pose.position.x:.6f}, {target_victim_pose.position.y:.6f}]")
+            self.mark_victim(target_victim_ps)
+            self.get_logger().info(f"found new victim at: [{target_victim_ps.pose.position.x:.6f}, {target_victim_ps.pose.position.y:.6f}]")
 
             # calculate goal position
-            self.victim_goal = self.calculate_goal_from_victim_pose(target_victim_pose)
+            self.victim_goal = self.calculate_approach_goal(target_victim_ps)
             self.transition_to_state(NavState.APPROACHING)
 
     '''-------------------------------------CAMERA RAW_IMAGE CALLBACK-------------------------------------------------------'''
@@ -270,7 +270,7 @@ class WaypointNavigator(rclpy.node.Node):
     def report_req_callback(self, empty_msg):
         for victim in self.captured_victims:
             self.victim_pub.publish(victim)
-        self.get_logger.info("\n\n---PUBLISHED VICTIMS---\n\n")
+        self.get_logger().info("\n\n---PUBLISHED VICTIMS---\n\n")
 
     '''-------------------------------------OCCUPANCY GRID CALLBACK---------------------------------------------------------'''
 
@@ -501,11 +501,10 @@ class WaypointNavigator(rclpy.node.Node):
 
             try:
                 map_ps = self.tf_buffer.transform(ps, "map")    # transform PoseStamped
-                map_p = map_ps.pose                             # take the Pose only
-                if self.victim_marked(map_p):
+                if self.victim_marked(map_ps):             # victim_marked takes a pose
                     continue                                    # skip victims we already marked
                 else:
-                    return map_p                                # return the transformed Pose
+                    return map_ps                                # return the transformed Pose
             except Exception as e:
                 self.get_logger().warn(f"Err: get_new_victim_pose() ::\n{e}\n\n")
                 continue
@@ -513,36 +512,37 @@ class WaypointNavigator(rclpy.node.Node):
 
     def build_victim_datum(self):
         victim = Victim()
-        victim.id = self.victim_count
+        victim.id = self.victim_count       # 1- assign id based on when captured
         self.victim_count += 1
 
-        ps = PointStamped()
-        ps.header.stamp = time.time() - self.start_time
-        ps.header.frame_id = "map"
-        (x, y) = self.marked_victims[-1] # grab the most recent victim published
-        ps.point.x = x
-        ps.point.y = y
-        ps.point.z = 0
-        victim.point = ps
+        pose_s = self.marked_victims[-1]    # grab the most recent victim marked
+        point_s = PointStamped()
+        point_s.header = pose_s.header
+        point_s.point.x = pose_s.pose.position.x
+        point_s.point.y = pose_s.pose.position.y
+        point_s.point.z = pose_s.pose.position.z
+        
+        victim.point = point_s              # 2- assign point
 
-        img = Image()
-        img = self.cur_image
-        victim.image = img
+        victim.image = self.cur_image       # 3- assign image
+
+        victim.description = ""             # 4- assign empty image
 
         return victim
 
-    def calculate_goal_from_victim_pose(self, victim_pose, distance=0.75):
+    def calculate_goal_from_victim_pose(self, victim_ps, distance=0.75):
         victim_quat = [
-            victim_pose.orientation.x,
-            victim_pose.orientation.y,
-            victim_pose.orientation.z,
-            victim_pose.orientation.w
+            victim_ps.pose.orientation.x,
+            victim_ps.pose.orientation.y,
+            victim_ps.pose.orientation.z,
+            victim_ps.pose.orientation.w
         ]
         _, _, victim_yaw = tf_transformations.euler_from_quaternion(victim_quat)
-        
+        victim_yaw = victim_yaw
+
         # position distance away from target relative to victim orientation
-        goal_x = victim_pose.position.x + distance * math.cos(victim_yaw)
-        goal_y = victim_pose.position.y + distance * math.sin(victim_yaw)
+        goal_x = victim_ps.pose.position.x + distance * math.cos(victim_yaw)
+        goal_y = victim_ps.pose.position.y + distance * math.sin(victim_yaw)
 
         # orient to face victim (180 deg opposit of victim's orientation)
         goal_yaw = victim_yaw + math.pi
@@ -552,21 +552,48 @@ class WaypointNavigator(rclpy.node.Node):
 
         return create_nav_goal(goal_x, goal_y, goal_yaw)
     
-    def mark_victim(self, victim_pose):
-        victim_x = victim_pose.position.x
-        victim_y = victim_pose.position.y
+    def calculate_approach_goal(self, victim_ps, distance=0.75):
+        ''' Calculate a goal for approaching the victim '''
+        victim_pos = np.array([             # extract victim position
+            victim_ps.pose.position.x,
+            victim_ps.pose.position.y,
+            victim_ps.pose.position.z
+        ])
+        victim_quat = [                     # extract victim orientation
+            victim_ps.pose.orientation.x,
+            victim_ps.pose.orientation.y,
+            victim_ps.pose.orientation.z,
+            victim_ps.pose.orientation.w
+        ]
+        # convert quat to rotation matrix
+        victim_rot_matrix = tf_transformations.quaternion_matrix(victim_quat)
+        # calculate victim's normal vector
+        victim_normal = victim_rot_matrix[:3, 2]
+        # calculate approach position [distance away along marker normal]
+        approach_pos = victim_pos + victim_normal * distance
 
-        self.marked_victims.append((victim_x, victim_y))
-        self.get_logger().info(f"Marked Victim at [{victim_pose.position.x:.4f}, {victim_pose.position.y:.4f}]")
+        # Calculate orientation
+        direction_to_victim = victim_pos - approach_pos
+        direction_to_victim = direction_to_victim / np.linalg.norm(direction_to_victim)
+        # calculate yaw
+        approach_yaw = np.arctan2(direction_to_victim[1], direction_to_victim[0])
+
+        return create_nav_goal(approach_pos[0], approach_pos[1], approach_yaw)
+
     
-    def victim_marked(self, victim_pose):
-        x_min = victim_pose.position.x - self.victim_x_tolerance
-        x_max = victim_pose.position.x + self.victim_x_tolerance
-        y_min = victim_pose.position.y - self.victim_y_tolerance
-        y_max = victim_pose.position.y + self.victim_y_tolerance
+    def mark_victim(self, victim_ps):
+        self.marked_victims.append(victim_ps)
+        self.get_logger().info(f"Marked Victim at [{victim_ps.pose.position.x:.4f}, {victim_ps.pose.position.y:.4f}]")
+    
+    def victim_marked(self, victim_ps):
+        x_min = victim_ps.pose.position.x - self.victim_x_tolerance
+        x_max = victim_ps.pose.position.x + self.victim_x_tolerance
+        y_min = victim_ps.pose.position.y - self.victim_y_tolerance
+        y_max = victim_ps.pose.position.y + self.victim_y_tolerance
         return any(
-            x_min <= vic_x <= x_max and y_min <= vic_y <= y_max 
-            for vic_x, vic_y in self.marked_victims
+            x_min <= victim.pose.position.x <= x_max
+            and y_min <= victim.pose.position.y <= y_max 
+            for victim in self.marked_victims
         )
     
     '''-------------------------------COMPETITION MANAGEMENT HELPERS--------------------------------------------------------'''
