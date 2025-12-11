@@ -57,7 +57,7 @@ class WaypointNavigator(rclpy.node.Node):
         # VICTIM TRACKING #
         self.declare_parameter(
             name="victim_x_tolerance",
-            value=0.5,
+            value=0.2,
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
                 description="Tolerance value for detecing victims in the x axis"
@@ -65,7 +65,7 @@ class WaypointNavigator(rclpy.node.Node):
         )
         self.declare_parameter(
             name="victim_y_tolerance",
-            value=0.5,
+            value=0.2,
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
                 description="Tolerance value for detecing victims in the y axis"
@@ -511,7 +511,7 @@ class WaypointNavigator(rclpy.node.Node):
         victim.point = ps
 
         img = Image()
-        img = self.cur_img
+        img = self.cur_image
         victim.image = img
 
         return victim

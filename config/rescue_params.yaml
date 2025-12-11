@@ -1,0 +1,5 @@
+/rescue_node:
+  ros__parameters:
+    victim_x_tolerance: 0.2
+    victim_y_tolerance: 0.2
+    time_limit: 300
