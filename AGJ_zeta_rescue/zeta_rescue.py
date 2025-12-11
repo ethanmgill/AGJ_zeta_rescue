@@ -26,12 +26,16 @@ from geometry_msgs.msg import PointStamped, PoseStamped, PoseArray, Pose
 
 from jmu_ros2_util import map_utils
 
+from ros2_aruco_interfaces.msg import ArucoMarkers
+
 from zeta_competition_interfaces.msg import Victim
 
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
-import tf2_geometry_msgs # needed even tho not used explicitly
 import tf_transformations
+import tf2_geometry_msgs # needed even tho not used explicitly
+import random #for sampling points
+from rclpy.time import Time
 
 def create_nav_goal(x, y, theta):
     goal = NavigateToPose.Goal()
@@ -53,6 +57,7 @@ class NavState(Enum):
     HOMEBOUND = 2   # returning home
     WAITING = 3     # waiting for a new goal
     CANCELING = 4   # cancelling navigation
+    SETUP = 5       # setting up competition
 
 class WaypointNavigator(rclpy.node.Node):
 
@@ -60,12 +65,13 @@ class WaypointNavigator(rclpy.node.Node):
         super().__init__('waypoint_nav')
 
         # TODO: change to use relative points based off of competition grid
-        self.waypoints = [
-            (-2.0, 2.5, 0.0), (-4.0, 2.0, 0.0), (1.5, 2.5, 0.0),
-            (4.0, 2.0, 0.0), (6.0, 2.0, -1.57), (6.0, 0.5, -1.57), (-4.0, 0.0, 0.0),
-            (-2.0, 0.0, 0.0), (1.5, 0.0, 0.0), (4.0, -0.2, 0.0), (6.0, -1.0, 1.57),
-            (-4.0, -1.5, 0.0), (-2.0, -2.0, 0.0), (1.5, -2.0, 0.0), (4.0, -2.0, 0.0),
-        ]
+        self.waypoints = []
+        #[
+            #(-2.0, 2.5, 0.0), (-4.0, 2.0, 0.0), (1.5, 2.5, 0.0),
+            #(4.0, 2.0, 0.0), (6.0, 2.0, -1.57), (6.0, 0.5, -1.57), (-4.0, 0.0, 0.0),
+            #(-2.0, 0.0, 0.0), (1.5, 0.0, 0.0), (4.0, -0.2, 0.0), (6.0, -1.0, 1.57),
+            #(-4.0, -1.5, 0.0), (-2.0, -2.0, 0.0), (1.5, -2.0, 0.0), (4.0, -2.0, 0.0),
+        #]
 
         self.map = None
 
@@ -84,10 +90,10 @@ class WaypointNavigator(rclpy.node.Node):
         
         self.declare_parameter(
             name="aruco_topic",
-            value="/aruco_poses",
+            value="/aruco_markers",
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
-                description="Aruco Poses topic to subscribe to",
+                description="Aruco Markers topic to subscribe to",
             ),
         )
 
@@ -131,7 +137,7 @@ class WaypointNavigator(rclpy.node.Node):
 
         # set state indicators
 
-        self.nav_state = NavState.WAITING
+        self.nav_state = NavState.SETUP
         self.nav_future = None # most recent status of nav service
         self.cancel_future = None
         self.goal = None # navigation service goal
@@ -139,12 +145,13 @@ class WaypointNavigator(rclpy.node.Node):
         self.map = None
         
         # initialize home pose to default: 0,0,0
-        self.home_x = 0.0
-        self.home_y = 0.0
-        self.home_theta = 0.0
+        # self.home_x = 0.0
+        # self.home_y = 0.0
+        # self.home_theta = 0.0
+        self.home_goal = None
 
         # declare current pose
-        self.cur_pose = PoseStamped()
+        self.cur_pose = None
 
         # declare current image (updated by camera topic)
         self.cur_image = None
@@ -155,10 +162,10 @@ class WaypointNavigator(rclpy.node.Node):
 
         # declare subscribers
         self.aruco_sub = self.create_subscription(
-            PoseArray, aruco_topic, self.aruco_callback, qos_profile_sensor_data
+            ArucoMarkers, '/aruco_markers', self.aruco_callback, qos_profile_sensor_data
         )
         self.cur_pose_sub = self.create_subscription(
-            PoseStamped, '/amcl_pose', self.cur_pose_callback, qos_profile_sensor_data
+            PoseStamped, '/amcl_pose', self.amcl_callback, qos_profile_sensor_data
         )
         ''' TODO: implement callback function
         self.report_req_sub = self.create_subscription(
@@ -193,7 +200,26 @@ class WaypointNavigator(rclpy.node.Node):
 
     ### COMPETITION MANAGEMENT ###
 
+    def setup(self):
+        if not self.map: # no map
+            self.get_logger().info("Waiting on map to be set...")
+            pass
+        elif not self.waypoints:
+            # If waypoints list is empty generate them from the map
+            self.get_logger().info("No waypoints set")
+            pass
+        elif not self.cur_image: # no image data from camera
+            self.get_logger().info("No msg from camera...")
+            pass
+        else: # we are ready. change state to waiting
+            self.nav_state = NavState.WAITING
+
     def timer_callback(self):
+        if (self.nav_state == NavState.SETUP): # competition not ready
+            self.get_logger().info("Setting up...")
+            self.setup()
+            return
+        
         elapsed = time.time() - self.start_time # how much time has it been since we started running?
         time_left = self.time_limit - elapsed # how much time is left in the competition?
         self.get_logger().info(f"\n\nTimer clock: [{elapsed:.2f}]\nTime left: [{time_left:.2f}]\nMarked Victim Count: [{len(self.marked_victims)}]\nVictim Count: [{len(self.captured_victims)}]\nCurrent Nav State: [{self.nav_state}]\n\n")
@@ -201,7 +227,6 @@ class WaypointNavigator(rclpy.node.Node):
         # Are we waiting for a goal to be canceled?
         if self.cancel_future is not None: # goal has been cancelled. Awaiting ACK from server
             self.get_logger().info("Canceling goal...")
-            #self.nav_state = NavState.CANCELING TODO: ensure commenting this out doesn't cause issues
             # have we gotten an ACK from the nav server?
             if self.cancel_future.done(): # if we are done cancelling the navigation
                 self.nav_future = None # reset nav_future for a new navigation task
@@ -219,7 +244,7 @@ class WaypointNavigator(rclpy.node.Node):
             # are we waiting to go home?
             elif self.nav_state == NavState.WAITING:
                 self.nav_state = NavState.HOMEBOUND # set variable to indicate we are returning home
-                self.goal = create_nav_goal(self.home_x, self.home_y, self.home_theta) # set nav goal to home point
+                self.goal = self.home_goal # set nav goal to home goal
                 self.send_goal() # send nav goal to nav service
                 self.get_logger().info("Home goal sent.")
             # have we canceled any ongoing navigation?
@@ -280,9 +305,31 @@ class WaypointNavigator(rclpy.node.Node):
         elif not self.nav_future.done():
             self.get_logger().warn(f"Navigation server has not accepted goal yet...")
 
+    def report_req_callback(self):
+        # TODO: iterate over victim list and publish to victim topic one by one
+        pass
 
-            
-    # TODO: this doesn't work with asynchronous programming
+    # SETUP FUNCTIONs #
+
+    def set_home_goal(self):
+        '''
+        Takes the current pose from /amcl_pose and assigns it to the home goal
+        '''
+        if not self.cur_pose:
+            self.get_logger().warn(f"No msg to grab from /amcl_pose")
+        home_x = self.cur_pose.pose.position.x
+        home_y = self.cur_pose.pose.position.y
+        home_theta = self.cur_pose.pose.orientation
+        _, _, yaw = tf_transformations.euler_from_quaternion(
+            [home_theta.x, home_theta.y, home_theta.z, home_theta.w]
+        )
+        home_theta = yaw
+
+        self.home_goal = create_nav_goal(home_x, home_y, home_theta)
+        self.get_logger().info(f"Start Goal Set: ({home_x:.2f}, {home_y:.2f}, {home_theta})")
+
+    '''
+    # NOTE: DEPRECATED
     def set_home_pose(self):
         """
         Spins and waits until the transform from base_link to map is valid.
@@ -317,16 +364,7 @@ class WaypointNavigator(rclpy.node.Node):
             if time.time() - self.start_time > 5.0:
                  self.get_logger().error("Could not find map transform! Defaulting to (0,0).")
                  return
-            
-    def cur_pose_callback(self, cur_pose):
-        # NOTE: accuracy unkown
-        # PoseWithCovarianceStamped -> PoseWithCovariance -> Pose
-        self.cur_pose = cur_pose.pose.pose
-
-    def report_req_callback(self):
-        # TODO: iterate over victim list and publish to victim topic one by one
-        pass
-
+    '''
 
     ### EXPLORATION ###
 
@@ -378,13 +416,46 @@ class WaypointNavigator(rclpy.node.Node):
     def map_callback(self, map_msg):
         """Process the map message.
 
-        This doesn't really do anything useful, it is purely intended
-        as an illustration of the Map class.
-
         """
         if self.map is None:  # No need to do this every time map is published.
 
+            # wrap OccupancyGrid with helper
             self.map = map_utils.Map(map_msg)
+
+            # derive world bounds from OccupancyGrid.info
+            info = map_msg.info
+            # store map info for other helpers
+            self.map_info = info
+            resolution = info.resolution
+            width = info.width
+            height = info.height
+            origin_x = info.origin.position.x
+            origin_y = info.origin.position.y
+            min_x = origin_x
+            min_y = origin_y
+            max_x = origin_x + (width * resolution)
+            max_y = origin_y + (height * resolution)
+
+            self.get_logger().info(f"Map received: bounds x:[{min_x:.2f},{max_x:.2f}] y:[{min_y:.2f},{max_y:.2f}] res={resolution:.3f}")
+
+            # --- 2) Populate random exploration waypoints on free cells ---
+            num_random = 20  # tuneable: number of exploration waypoints to generate
+            max_attempts_per_point = 200
+            added = 0 # how many points have been added
+            attempts = 0 # how many attempts per point
+            # margin to avoid map edges (meters)
+            # margin = max(0.5, resolution * 2)
+
+            while added < num_random and attempts < num_random * max_attempts_per_point:
+                attempts += 1
+                rx = random.uniform(min_x, max_x)
+                ry = random.uniform(min_y, max_y)
+                if self.cell_is_free(rx, ry):
+                    rtheta = random.uniform(-math.pi, math.pi)
+                    self.waypoints.append((rx, ry, rtheta))
+                    added += 1
+            self.get_logger().info(f"Populated {added} random exploration waypoints (requested {num_random}). Total waypoints: {len(self.waypoints)}")
+
             '''
             # Use numpy to calculate some statistics about the map:
             total_cells = self.map.width * self.map.height
@@ -409,10 +480,16 @@ class WaypointNavigator(rclpy.node.Node):
 
     def cell_is_free(self, x, y):
         val = self.map.get_cell(x, y)
-        if val == 0:
+        if val == 0: # cell is definitely free
             return True
-        else:
+        else: # cell might not be free. default to occupied
             return False
+    
+    def amcl_callback(self, cur_pose):
+        # PoseWithCovarianceStamped -> PoseWithCovariance -> Pose
+        self.cur_pose = cur_pose.pose.pose
+        if self.home_goal is None:
+            self.set_home_goal()
     
 
     ### ArUco Code detection, navigation, and capture ###
@@ -428,22 +505,27 @@ class WaypointNavigator(rclpy.node.Node):
             return
 
         if self.nav_state != NavState.APPROACHING: # we've already locked on to a victim. No need to calculate
-            # transform aruco locations
             map_poses = []
             for pose in aruco_msg.poses:
                 pose_stamped = PoseStamped()
-                pose_stamped.header.frame_id = "oakd_rgb_camera_optical_frame"
+                pose_stamped.header = aruco_msg.header
                 pose_stamped.pose = pose
-                for _ in range(10):
+
+                for _ in range(4):
                     try:
                         map_pose_stamped = self.tf_buffer.transform(pose_stamped, "map")
                         map_pose = map_pose_stamped.pose
                         map_poses.append(map_pose)
                         break
                     except Exception as e:
-                        self.get_logger().warn(f"ArUco pose transformation error: {str(e)}")
+                        self.get_logger().warn(f"ArUco pose transformation error: \n{str(e)}\n")
+                        self.get_logger().warn(f"\nArUco time stamp: [{pose_stamped.header.stamp}]\nMap time stamp:")
 
             # pick first seen victim
+            if len(map_poses) == 0:
+                self.get_logger().warn("FAILED TO ADD MARKER")
+                return
+            
             target_victim_pose = map_poses[0]
 
             # TODO: iterate over target_victim_poses to find one that hasn't been marked.
