@@ -117,7 +117,7 @@ class WaypointNavigator(rclpy.node.Node):
         # COMPETITION MANAGEMENT #
         self.start_time = time.time()
         self.time_limit = self.get_parameter('time_limit').value
-        self.recall_time = 50           # time at which the robot must return
+        self.recall_time = 60           # time at which the robot must return
                                         # TODO: calculate with cur_pose callback
 
         '''---------------SUBSCRIPTIONS--------------'''
@@ -429,10 +429,7 @@ class WaypointNavigator(rclpy.node.Node):
         else:                               # we're already navigating home :)
             if self.nav_future.result().status == GoalStatus.STATUS_SUCCEEDED:
                 self.get_logger().info("\n\n\nARRIVED AT HOME GOAL\n\n\n")
-                try:
-                    rclpy.shutdown()
-                except Exception as e:
-                    self.get_logger().warn("Failed to shutdown.")
+                # stay spinning
                 pass
             else:
                 self.handle_navigation_status(recovery_state=NavState.HOMEBOUND)
