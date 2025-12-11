@@ -22,7 +22,7 @@ from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.action import NavigateToPose
 
 from geometry_msgs.msg import Twist
-from geometry_msgs.msg import PointStamped, PoseStamped, PoseArray, Pose
+from geometry_msgs.msg import PointStamped, PoseStamped, PoseWithCovarianceStamped
 
 from jmu_ros2_util import map_utils
 
@@ -123,18 +123,16 @@ class WaypointNavigator(rclpy.node.Node):
         '''---------------SUBSCRIPTIONS--------------'''
 
         # COMPETITION MANAGEMENT #
-        ''' TODO: implement callback function
         self.create_subscription(
             Empty, '/report_requested', self.report_req_callback, 10
         )
-        '''
 
         # NAVIGATION / EXPLORATION #
         self.create_subscription(
             OccupancyGrid, 'map', self.map_callback, qos_profile=latching_qos
         )
         self.cur_pose_sub = self.create_subscription(
-            PoseStamped, '/amcl_pose', self.amcl_callback, qos_profile_sensor_data
+            PoseWithCovarianceStamped, '/amcl_pose', self.amcl_callback, qos_profile_sensor_data
         )
 
         # VICTIM TRACKING #
@@ -188,16 +186,28 @@ class WaypointNavigator(rclpy.node.Node):
         
         elapsed = time.time() - self.start_time         # how much time has it been since we started running?
         time_left = self.time_limit - elapsed           # how much time is left in the competition?
-        self.get_logger().info(f"\n\nTimer clock: [{elapsed:.2f}]\nTime left: [{time_left:.2f}]\nMarked Victim Count: [{len(self.marked_victims)}]\nVictim Count: [{len(self.captured_victims)}]\nCurrent Nav State: [{self.nav_state}]\n\n")
+        
+        self.get_logger().info(f"""\n\n
+            Timer clock: [{elapsed:.2f}]\n
+            Time left: [{time_left:.2f}]\n
+            Marked Victim Count: [{len(self.marked_victims)}]\n
+            Victim Count: [{len(self.captured_victims)}]\n
+            Current Nav State: [{self.nav_state}]
+            Home Set: [{self.home_goal is not None}]
+            \n\n""")
 
         # are we out of time?
         if time_left < self.recall_time:
             # are we already going home?
             if self.nav_state == NavState.HOMEBOUND:
+                self.get_logger().warn(f"\nTime low! Heading home...\n")
                 self.handle_homebound()
+            # are we getting ready to go home?
+            elif self.nav_state == NavState.RECALIBRATING:
+                self.handle_recalibration()
             # are we waiting to go home?
             else:
-                self.get_logger().warn(f"\nTime low! Heading home...\n")
+                self.get_logger().warn(f"\nTime low! Rerouting to home...\n")
                 self.transition_to_state(NavState.HOMEBOUND)
 
         # we still have time left; continue the mission.
@@ -257,9 +267,10 @@ class WaypointNavigator(rclpy.node.Node):
     
     '''-------------------------------------REQUEST REPORT CALLBACK---------------------------------------------------------'''
 
-    def report_req_callback(self):
-        # TODO: iterate over victim list and publish to victim topic one by one
-        pass
+    def report_req_callback(self, empty_msg):
+        for victim in self.captured_victims:
+            self.victim_pub.publish(victim)
+        self.get_logger.info("\n\n---PUBLISHED VICTIMS---\n\n")
 
     '''-------------------------------------OCCUPANCY GRID CALLBACK---------------------------------------------------------'''
 
@@ -459,13 +470,17 @@ class WaypointNavigator(rclpy.node.Node):
         '''
         if not self.cur_pose:
             self.get_logger().warn(f"No msg to grab from /amcl_pose")
-        home_x = self.cur_pose.pose.position.x
-        home_y = self.cur_pose.pose.position.y
-        home_theta = self.cur_pose.pose.orientation
+            return
+        home_x = self.cur_pose.position.x
+        home_y = self.cur_pose.position.y
+        home_theta = self.cur_pose.orientation
         _, _, yaw = tf_transformations.euler_from_quaternion(
             [home_theta.x, home_theta.y, home_theta.z, home_theta.w]
         )
         home_theta = yaw
+
+        # if any(val is None for val in [home_x, home_y, home_theta]):
+        #     return
 
         self.home_goal = create_nav_goal(home_x, home_y, home_theta)
         self.get_logger().info(f"Start Goal Set: ({home_x:.2f}, {home_y:.2f}, {home_theta})")
