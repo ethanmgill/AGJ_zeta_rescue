@@ -162,7 +162,7 @@ class WaypointNavigator(rclpy.node.Node):
         )
 
         # COMPETITION MANAGEMENT #
-        self.timer = self.create_timer(0.5, self.timer_callback) # timer for competition management
+        self.timer = self.create_timer(0.1, self.timer_callback) # timer for competition management
 
         '''-----------------------------------------------------------------------------------------------------------------'''
 
@@ -195,7 +195,6 @@ class WaypointNavigator(rclpy.node.Node):
             Current Nav State: [{self.nav_state}]
             Home Set: [{self.home_goal is not None}]
             \n\n""")
-
         # are we out of time?
         if time_left < self.recall_time:
             # are we already going home?
@@ -268,8 +267,10 @@ class WaypointNavigator(rclpy.node.Node):
     '''-------------------------------------REQUEST REPORT CALLBACK---------------------------------------------------------'''
 
     def report_req_callback(self, empty_msg):
+        self.get_logger().warn(f"\n\n\n PUBLISHING VICTIMS \n\n\n\n\n")
         for victim in self.captured_victims:
             self.victim_pub.publish(victim)
+            self.get_logger().info(f"Published Victim at [{victim.point.point.x}, {victim.point.point.y}]")
         self.get_logger().info("\n\n---PUBLISHED VICTIMS---\n\n")
 
     '''-------------------------------------OCCUPANCY GRID CALLBACK---------------------------------------------------------'''
@@ -501,7 +502,7 @@ class WaypointNavigator(rclpy.node.Node):
 
             try:
                 map_ps = self.tf_buffer.transform(ps, "map")    # transform PoseStamped
-                if self.victim_marked(map_ps):             # victim_marked takes a pose
+                if self.victim_marked(map_ps):             # victim_marked takes a pose stamped
                     continue                                    # skip victims we already marked
                 else:
                     return map_ps                                # return the transformed Pose
